@@ -1,0 +1,14 @@
+# test run artifacts (regenerated each run)
+test/_*.txt
+
+# compiled zsh
+*.zwc
+
+# completion data cache (auto-refreshed per claude version)
+.cache/
+
+.DS_Store
+
+# editor / machine-local
+.idea/
+.claude/settings.local.json

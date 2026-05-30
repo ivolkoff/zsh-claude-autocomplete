@@ -1,0 +1,86 @@
+#compdef claude
+# zsh completion for the Claude Code CLI (`claude`).
+#
+# Static surface (subcommands, flags, enumerated choices) comes from a generated,
+# version-pinned data file (lib/_claude_data.zsh). Dynamic values (models,
+# slash-commands, skills, sessions, @paths) are resolved at completion time from
+# ~/.claude and the filesystem via lib/_claude_sources.zsh. Never forks `claude`
+# on the hot path.
+#
+# The whole implementation is wrapped in `_claude() { ... }` and then called, so
+# every `local` is unambiguously inside a function regardless of whether this
+# file is autoloaded or sourced.
+
+_claude() {
+  # --- locate ourselves & load data + sources ----------------------------
+  local _cl_dir=${_CLAUDE_AC_DIR:-${${(%):-%x}:A:h}}
+
+  [[ -z ${_claude_data_version-} && -r $_cl_dir/lib/_claude_data.zsh ]] && \
+    source $_cl_dir/lib/_claude_data.zsh
+  (( ${+functions[__claude_list_models]} )) || \
+    source $_cl_dir/lib/_claude_sources.zsh
+
+  # Refresh the snapshot once if the installed `claude` version drifted.
+  __claude_refresh_if_stale $_cl_dir
+
+  # Build the _arguments option specs (logic in lib/_claude_sources.zsh).
+  __claude_build_specs
+
+  local curcontext=$curcontext state line
+  typeset -A opt_args
+
+  _arguments -C -s \
+    $_claude_specs \
+    '1: :->command' \
+    '*:: :->args' && return 0
+
+  # In any value slot, if the user is clearly starting another flag, show the
+  # flag list instead of the value completer (so completion never dead-ends).
+  case $state in
+    models|sessions|choice|dirs|files|value)
+      if [[ $PREFIX == -* ]]; then __claude_flag_fallback; return; fi
+      ;;
+  esac
+
+  case $state in
+    command)
+      local -a subs
+      local s
+      for s in $_claude_subcommands; do subs+=( "${s%%:*}:${s#*:}" ); done
+      _describe -t commands 'claude command' subs
+      ;;
+    models)
+      local -a m=( ${(f)"$(__claude_list_models)"} )
+      (( ${#m} )) && _describe -t models 'model' m
+      ;;
+    sessions)
+      local -a ss=( ${(f)"$(__claude_list_sessions)"} )
+      (( ${#ss} )) && _describe -t sessions 'session' ss
+      ;;
+    choice)
+      # Enumerated value: look up the choices for the flag just before the cursor.
+      local prev=${words[CURRENT-1]} ch
+      ch=${_claude_choices[$prev]}
+      [[ -n $ch ]] && compadd -- ${=ch}
+      ;;
+    dirs)  _files -/ ;;
+    files) _files ;;
+    value)
+      # A value with no known completer — show a hint rather than nothing.
+      _message -e values 'value'
+      ;;
+    args)
+      if [[ $PREFIX == @* ]]; then
+        compset -P '@'; _files
+      elif [[ $PREFIX == /* ]]; then
+        compset -P '/'
+        local -a sc=( ${(f)"$(__claude_list_commands)"} ${(f)"$(__claude_list_skills)"} )
+        (( ${#sc} )) && _describe -t commands 'slash command' sc
+      else
+        _default
+      fi
+      ;;
+  esac
+}
+
+_claude "$@"

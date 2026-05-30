@@ -1,0 +1,14 @@
+Usage: claude [options] [command]
+
+Some description.
+
+Options:
+  --foo <mode>                          Some long description that wraps onto
+                                        another line (choices: "aa", "bb",
+                                        "cc")
+  -b, --bar                             A boolean flag
+  --baz, --baz-alias <value>            Takes a value, no choices
+
+Commands:
+  doit                                  Do the thing
+  combo|c                               Aliased command

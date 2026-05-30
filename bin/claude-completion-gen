@@ -1,0 +1,204 @@
+#!/usr/bin/env zsh
+# claude-completion-gen — generate lib/_claude_data.zsh from `claude --help`.
+#
+# Parses the top-level help (subcommands, flags, value-arity, descriptions,
+# enumerated choices) into a pure-data zsh file the completion reads. The data
+# file is committed as a version-pinned snapshot so completion works offline and
+# never forks `claude` on the hot path.
+#
+# Usage:
+#   claude-completion-gen [--help-file FILE] [--version-string VER] [--out FILE]
+#
+# With no flags it runs `claude --help` / `claude --version` itself. The
+# --help-file / --version-string options let the test suite feed a captured
+# fixture instead of the live binary.
+
+emulate -L zsh
+setopt pipefail extended_glob extended_glob
+
+typeset self_dir=${0:A:h}
+typeset repo_dir=${self_dir:h}
+typeset help_file="" version_string="" out_file="$repo_dir/lib/_claude_data.zsh"
+
+while (( $# )); do
+  case "$1" in
+    --help-file)       help_file=$2; shift 2 ;;
+    --version-string)  version_string=$2; shift 2 ;;
+    --out)             out_file=$2; shift 2 ;;
+    -h|--help)
+      print -r -- "usage: claude-completion-gen [--help-file FILE] [--version-string VER] [--out FILE]"
+      return 0 2>/dev/null || exit 0 ;;
+    *) print -ru2 -- "unknown argument: $1"; return 2 2>/dev/null || exit 2 ;;
+  esac
+done
+
+# --- gather raw help text -------------------------------------------------
+typeset help_text
+if [[ -n $help_file ]]; then
+  help_text=$(<"$help_file")
+else
+  if ! command -v claude >/dev/null 2>&1; then
+    print -ru2 -- "claude not found on \$PATH; cannot generate. Pass --help-file."
+    return 1 2>/dev/null || exit 1
+  fi
+  help_text=$(COLUMNS=200 command claude --help 2>&1)
+  [[ -z $version_string ]] && version_string=$(command claude --version 2>&1)
+fi
+
+# Reduce the version line to the bare dotted token (e.g. "2.1.156").
+if [[ -n $version_string ]]; then
+  version_string=${version_string//[^0-9.]/ }
+  typeset -a _vparts=( ${(z)version_string} )
+  version_string=${_vparts[1]}
+fi
+[[ -z $version_string ]] && version_string="unknown"
+
+# --- parse ----------------------------------------------------------------
+typeset -a lines=( "${(@f)help_text}" )
+typeset -a subcommands flag_names
+typeset -A flag_desc flag_arg flag_short flag_choices
+
+typeset section="" line stripped sig desc part name rest tail tok
+typeset cur_long="" cur_sig="" cur_desc="" short_pending=""
+typeset -a parts vals
+
+flush_flag() {
+  [[ -z $cur_long ]] && return 0
+  if (( ${flag_names[(I)$cur_long]} )); then
+    cur_long="" cur_sig="" cur_desc="" short_pending=""
+    return 0
+  fi
+  flag_names+=( "$cur_long" )
+  # squeeze whitespace runs to single spaces and trim
+  desc=${cur_desc//[[:space:]]##/ }
+  desc=${desc## }; desc=${desc%% }
+  flag_desc[$cur_long]=$desc
+  if [[ $cur_sig == *'<'* || $cur_sig == *'['* || $cur_sig == *'='* ]]; then
+    flag_arg[$cur_long]=1
+  else
+    flag_arg[$cur_long]=0
+  fi
+  if [[ $cur_desc == *choices:* ]]; then
+    tail=${cur_desc#*choices:}
+    tail=${tail%%\)*}
+    vals=()
+    for tok in ${(s:,:)tail}; do
+      tok=${tok//[\"\'\(\) ]/}
+      # Drop empty tokens and commander metadata like "preset:true" — a ':' is
+      # not a real choice value and would corrupt the (choices) _arguments action.
+      [[ -z $tok || $tok == *:* ]] && continue
+      vals+=( "$tok" )
+    done
+    (( ${#vals} )) && flag_choices[$cur_long]="${vals[*]}"
+  fi
+  cur_long="" cur_sig="" cur_desc="" short_pending=""
+}
+
+for line in "${lines[@]}"; do
+  case "$line" in
+    Options:*)  flush_flag; section="options";  continue ;;
+    Commands:*) flush_flag; section="commands"; continue ;;
+  esac
+  [[ -z $section ]] && continue
+  if [[ -z ${line// /} ]]; then
+    [[ $section == options ]] && flush_flag
+    continue
+  fi
+
+  if [[ $section == options ]]; then
+    if [[ $line == "  "[-]* ]]; then
+      flush_flag
+      stripped=${line##  }
+      if [[ $stripped == *"  "* ]]; then
+        sig=${stripped%%  *}
+        desc=${stripped#$sig}
+      else
+        sig=$stripped; desc=""
+      fi
+      cur_sig=$sig
+      cur_desc=${desc## }
+      parts=( ${(s:,:)sig} )
+      for part in $parts; do
+        part=${part## }; part=${part%% *}
+        case "$part" in
+          --*) cur_long=${part%%=*} ;;
+          -?)  short_pending=$part ;;
+        esac
+      done
+      [[ -n $cur_long && -n $short_pending ]] && flag_short[$cur_long]=$short_pending
+    else
+      stripped=${line##[[:space:]]##}
+      [[ -n $cur_long ]] && cur_desc="${cur_desc} ${stripped}"
+    fi
+  elif [[ $section == commands ]]; then
+    if [[ $line == "  "[a-z]* ]]; then
+      stripped=${line##  }
+      if [[ $stripped == *"  "* ]]; then
+        name=${stripped%%  *}
+        rest=${stripped#$name}
+      else
+        name=$stripped; rest=""
+      fi
+      name=${name%% *}
+      name=${name%%\|*}
+      rest=${rest//[[:space:]]##/ }
+      rest=${rest## }; rest=${rest%% }
+      [[ $name == help ]] && continue
+      subcommands+=( "${name}:${rest}" )
+    fi
+  fi
+done
+flush_flag
+
+# Curated choice overrides for flags whose help states the value set in prose
+# instead of commander's machine-readable `choices:` (parser can't auto-detect).
+typeset -A choice_overrides=(
+  '--effort' 'low medium high xhigh max'
+)
+typeset ov
+for ov in ${(k)choice_overrides}; do
+  [[ -n ${flag_arg[$ov]} && -z ${flag_choices[$ov]} ]] && flag_choices[$ov]=${choice_overrides[$ov]}
+done
+
+if (( ${#flag_names} == 0 )); then
+  print -ru2 -- "parsed 0 flags — help format may have changed; aborting."
+  return 1 2>/dev/null || exit 1
+fi
+
+# --- emit -----------------------------------------------------------------
+typeset fn sc
+{
+  print -r -- "# Generated by bin/claude-completion-gen — do not edit by hand."
+  print -r -- "# Source: claude --help (version ${version_string})."
+  print -r -- "typeset -g _claude_data_version=${(qq)version_string}"
+  print -r --
+  print -r -- "typeset -ga _claude_subcommands=("
+  for sc in $subcommands; do print -r -- "  ${(qq)sc}"; done
+  print -r -- ")"
+  print -r --
+  print -r -- "typeset -ga _claude_flag_names=("
+  for fn in $flag_names; do print -r -- "  ${(qq)fn}"; done
+  print -r -- ")"
+  print -r --
+  print -r -- "typeset -gA _claude_flag_desc=("
+  for fn in $flag_names; do print -r -- "  ${(qq)fn} ${(qq)flag_desc[$fn]}"; done
+  print -r -- ")"
+  print -r --
+  print -r -- "typeset -gA _claude_flag_arg=("
+  for fn in $flag_names; do print -r -- "  ${(qq)fn} ${flag_arg[$fn]}"; done
+  print -r -- ")"
+  print -r --
+  print -r -- "typeset -gA _claude_flag_short=("
+  for fn in $flag_names; do
+    [[ -n ${flag_short[$fn]} ]] && print -r -- "  ${(qq)fn} ${(qq)flag_short[$fn]}"
+  done
+  print -r -- ")"
+  print -r --
+  print -r -- "typeset -gA _claude_choices=("
+  for fn in $flag_names; do
+    [[ -n ${flag_choices[$fn]} ]] && print -r -- "  ${(qq)fn} ${(qq)flag_choices[$fn]}"
+  done
+  print -r -- ")"
+} > "$out_file"
+
+print -r -- "wrote ${out_file} (version ${version_string}, ${#subcommands} subcommands, ${#flag_names} flags, ${#flag_choices} choice-flags)"
